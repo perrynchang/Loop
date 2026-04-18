@@ -56,7 +56,12 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr_frac=0.1):
 
 
 def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
 
     # Build dataset

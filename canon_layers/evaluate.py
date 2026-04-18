@@ -198,7 +198,8 @@ def main():
     p.add_argument("--K", type=int, default=8)
     p.add_argument("--L", type=int, default=10)
     p.add_argument("--n_samples", type=int, default=200)
-    p.add_argument("--device", default="cpu")
+    default_device = "mps" if torch.backends.mps.is_available() else "cpu"
+    p.add_argument("--device", default=default_device)
     args = p.parse_args()
 
     device = torch.device(args.device)
