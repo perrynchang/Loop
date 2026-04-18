@@ -1,0 +1,17 @@
+# Depo1 (K=8) with RoPE + Canon-ABCD (replicates paper's Result 2)
+task: depo
+variant: depo1
+N: 225
+K: 8
+
+model_size: 12L768D
+rope: rope
+rope_fraction: 1.0
+canon: ABCD
+canon_residual: true
+
+lr: 0.001
+weight_decay: 0.03
+batch_size: 64
+max_steps: 150000
+warmup_steps: 1000

@@ -1,0 +1,16 @@
+# Mano (L=16) with RoPE + Canon-ABCD (replicates paper's Result 2 for knowledge manipulation)
+task: mano
+variant: ""
+L: 16
+
+model_size: 12L768D
+rope: rope
+rope_fraction: 1.0
+canon: ABCD
+canon_residual: true
+
+lr: 0.001
+weight_decay: 0.1
+batch_size: 64
+max_steps: 110000
+warmup_steps: 1000

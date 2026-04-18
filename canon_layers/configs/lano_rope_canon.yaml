@@ -1,0 +1,15 @@
+# Lano (cfg3k) with RoPE + Canon-ABCD (replicates paper's hierarchical language structure experiment)
+task: lano
+variant: cfg3k
+
+model_size: 12L768D
+rope: rope
+rope_fraction: 1.0
+canon: ABCD
+canon_residual: true
+
+lr: 0.0005
+weight_decay: 0.1
+batch_size: 96
+max_steps: 100000
+warmup_steps: 0
