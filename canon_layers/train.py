@@ -188,7 +188,7 @@ def parse_args():
 
     # Model
     p.add_argument("--model_size", default="8L512D",
-                   choices=["8L512D", "12L512D", "8L768D", "12L768D"],
+                   choices=["6L256D", "8L512D", "12L512D", "8L768D", "12L768D"],
                    help="Model size: {layers}L{hidden}D")
     p.add_argument("--rope", choices=["rope", "nope", "none"], default="rope",
                    help="Positional encoding type")

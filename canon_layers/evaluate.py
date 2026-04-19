@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from collections import defaultdict
 
 from models import build_transformer
-from tasks.depo import DepoTokenizer, build_expr as depo_build_expr
+from tasks.depo import DepoTokenizer
 from tasks.brevo import BrevoTokenizer, build_random_dag, topological_reachable
 from tasks.mano import ManoTokenizer, build_expr, eval_expr, serialize_expr, MOD
 from tasks.lano import LanoTokenizer, CFG_RULES, CFG_ROOTS, generate_sentence, is_valid_cfg
@@ -36,8 +36,11 @@ def load_model(checkpoint_path, device):
         rope_fraction=args.get('rope_fraction', 1.0),
         canon_positions=args.get('canon', ''),
         canon_residual=args.get('canon_residual', True),
+        max_seq_len=2048,
     )
-    model.load_state_dict(ckpt['model_state'])
+    state = {k: v for k, v in ckpt['model_state'].items()
+             if not any(k.endswith(s) for s in ('attn.mask', 'rope.cos_cached', 'rope.sin_cached'))}
+    model.load_state_dict(state, strict=False)
     model.to(device)
     model.eval()
     return model, args
