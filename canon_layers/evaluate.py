@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from collections import defaultdict
 
-from models import build_transformer
+from models import build_transformer, build_loop_transformer
 from tasks.depo import DepoTokenizer
 from tasks.brevo import BrevoTokenizer, build_random_dag, topological_reachable
 from tasks.mano import ManoTokenizer, build_expr, eval_expr, serialize_expr, MOD
@@ -29,15 +29,29 @@ def load_model(checkpoint_path, device):
     }
     vocab_size = task_vocab.get(args['task'], 256)
 
-    model = build_transformer(
-        vocab_size=vocab_size,
-        size=args['model_size'],
-        rope=(args['rope'] != 'none'),
-        rope_fraction=args.get('rope_fraction', 1.0),
-        canon_positions=args.get('canon', ''),
-        canon_residual=args.get('canon_residual', True),
-        max_seq_len=2048,
-    )
+    use_loop = args.get('model_type', 'transformer') == 'loop'
+    if use_loop:
+        model = build_loop_transformer(
+            vocab_size=vocab_size,
+            size=args['model_size'],
+            rope=(args['rope'] != 'none'),
+            rope_fraction=args.get('rope_fraction', 1.0),
+            canon_positions=args.get('canon', ''),
+            canon_residual=args.get('canon_residual', True),
+            max_seq_len=2048,
+            T_max=args.get('T_max', 4),
+        )
+    else:
+        model = build_transformer(
+            vocab_size=vocab_size,
+            size=args['model_size'],
+            rope=(args['rope'] != 'none'),
+            rope_fraction=args.get('rope_fraction', 1.0),
+            canon_positions=args.get('canon', ''),
+            canon_residual=args.get('canon_residual', True),
+            max_seq_len=2048,
+        )
+
     state = {k: v for k, v in ckpt['model_state'].items()
              if not any(k.endswith(s) for s in ('attn.mask', 'rope.cos_cached', 'rope.sin_cached'))}
     model.load_state_dict(state, strict=False)

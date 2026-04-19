@@ -11,7 +11,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models import build_transformer, count_canon_params
+from models import build_transformer, build_loop_transformer, count_canon_params
+from models.loop import LoopLM
 from tasks import (
     build_depo_dataset, DepoTokenizer,
     build_brevo_dataset, BrevoTokenizer,
@@ -83,8 +84,6 @@ def train(args):
     )
     print(f"Context length: {context_len}")
 
-    # num_workers=0 keeps data generation in the main process — much faster on MPS
-    # where subprocess IPC overhead dominates over parallelism benefits at small batch sizes
     num_workers = 0 if device.type == "mps" else min(4, os.cpu_count())
     dataloader = DataLoader(
         dataset,
@@ -94,23 +93,39 @@ def train(args):
     )
 
     # Build model
-    model = build_transformer(
-        vocab_size=vocab_size,
-        size=args.model_size,
-        rope=(args.rope != "none"),
-        rope_fraction=args.rope_fraction,
-        canon_positions=args.canon,
-        canon_residual=args.canon_residual,
-        max_seq_len=context_len,
-        tie_weights=args.tie_weights,
-    ).to(device)
+    use_loop = (args.model_type == "loop")
+    if use_loop:
+        model = build_loop_transformer(
+            vocab_size=vocab_size,
+            size=args.model_size,
+            rope=(args.rope != "none"),
+            rope_fraction=args.rope_fraction,
+            canon_positions=args.canon,
+            canon_residual=args.canon_residual,
+            max_seq_len=context_len,
+            tie_weights=args.tie_weights,
+            T_max=args.T_max,
+        ).to(device)
+    else:
+        model = build_transformer(
+            vocab_size=vocab_size,
+            size=args.model_size,
+            rope=(args.rope != "none"),
+            rope_fraction=args.rope_fraction,
+            canon_positions=args.canon,
+            canon_residual=args.canon_residual,
+            max_seq_len=context_len,
+            tie_weights=args.tie_weights,
+        ).to(device)
 
     n_params = model.num_parameters()
     n_canon = count_canon_params(model)
     print(f"Model parameters: {n_params:,} total, {n_canon:,} Canon ({100*n_canon/n_params:.2f}%)")
-    print(f"Architecture: {args.model_size} | RoPE={args.rope} | Canon={args.canon}")
+    model_desc = f"{args.model_size} | RoPE={args.rope} | Canon={args.canon}"
+    if use_loop:
+        model_desc += f" | LoopLM T_max={args.T_max} β={args.loop_beta}"
+    print(f"Architecture: {model_desc}")
 
-    # Optimizer: AdamW with paper's hyperparameters
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -124,13 +139,15 @@ def train(args):
     step = 0
     total_loss = 0.0
     log_interval = 100
+    # Extra metrics tracked for LoopLM
+    total_entropy = 0.0
+    total_avg_exit = 0.0
 
     pbar = tqdm(total=args.max_steps, desc="Training", unit="step", dynamic_ncols=True)
     for batch in dataloader:
         if step >= args.max_steps:
             break
 
-        # Update learning rate
         lr = get_lr(step, args.warmup_steps, args.max_steps, args.lr)
         for pg in optimizer.param_groups:
             pg['lr'] = lr
@@ -139,11 +156,16 @@ def train(args):
         inputs = x[:, :-1]
         targets = x[:, 1:]
 
-        logits = model(inputs)
-        loss = nn.functional.cross_entropy(
-            logits.reshape(-1, vocab_size),
-            targets.reshape(-1),
-        )
+        if use_loop:
+            loss, metrics = model.loop_loss(inputs, targets, beta=args.loop_beta)
+            total_entropy += metrics['entropy']
+            total_avg_exit += metrics['avg_exit_step']
+        else:
+            logits = model(inputs)
+            loss = nn.functional.cross_entropy(
+                logits.reshape(-1, vocab_size),
+                targets.reshape(-1),
+            )
 
         optimizer.zero_grad()
         loss.backward()
@@ -156,12 +178,23 @@ def train(args):
 
         if step % log_interval == 0:
             avg_loss = total_loss / log_interval
-            pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
+            if use_loop:
+                avg_ent = total_entropy / log_interval
+                avg_exit = total_avg_exit / log_interval
+                pbar.set_postfix(
+                    loss=f"{avg_loss:.4f}",
+                    ent=f"{avg_ent:.3f}",
+                    exit=f"{avg_exit:.2f}",
+                    lr=f"{lr:.2e}",
+                )
+                total_entropy = 0.0
+                total_avg_exit = 0.0
+            else:
+                pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
             total_loss = 0.0
 
     pbar.close()
 
-    # Save checkpoint
     if args.save_path:
         os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
         torch.save({
@@ -187,9 +220,16 @@ def parse_args():
     p.add_argument("--L", type=int, default=10, help="Max expression length (Mano)")
 
     # Model
+    p.add_argument("--model_type", choices=["transformer", "loop"], default="transformer",
+                   help="Model type: standard transformer or LoopLM")
     p.add_argument("--model_size", default="8L512D",
                    choices=["6L256D", "8L512D", "12L512D", "8L768D", "12L768D"],
                    help="Model size: {layers}L{hidden}D")
+    # LoopLM-specific
+    p.add_argument("--T_max", type=int, default=4,
+                   help="Number of recurrent steps (LoopLM only)")
+    p.add_argument("--loop_beta", type=float, default=0.1,
+                   help="Entropy regularisation coefficient β (LoopLM Stage I)")
     p.add_argument("--rope", choices=["rope", "nope", "none"], default="rope",
                    help="Positional encoding type")
     p.add_argument("--rope_fraction", type=float, default=1.0,
