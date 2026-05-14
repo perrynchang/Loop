@@ -19,16 +19,20 @@ from tasks import (
     build_mano_dataset, ManoTokenizer,
     build_lano_dataset, LanoTokenizer,
     build_capo_dataset,
+    build_bios_dataset, BioSTokenizer,
+    build_bios32_dataset, BioS32Tokenizer,
 )
 
 
 TASK_DEFAULT_CONTEXT = {
     "depo": 2048, "brevo1": 1024, "brevo2": 1536,
     "mano": 1024, "cfg3f": 512, "cfg3j": 1536, "cfg3k": 1536, "capo": 512,
+    "bios": 512, "bios32": 512,
 }
 
 
-def get_task_config(task, variant, N, K, L, context_len_override=None):
+def get_task_config(task, variant, N, K, L, context_len_override=None,
+                    bios_query_types='all', bios_cot_prob=0.5):
     """Return (dataset, vocab_size, context_len) for a given task."""
     if task == "depo":
         ctx = context_len_override or TASK_DEFAULT_CONTEXT["depo"]
@@ -54,6 +58,23 @@ def get_task_config(task, variant, N, K, L, context_len_override=None):
         ctx = context_len_override or TASK_DEFAULT_CONTEXT["capo"]
         ds = build_capo_dataset(N=N)
         return ds, 256, ctx
+    elif task == "bios":
+        # variant encodes augmentations: e.g. "", "permute", "permute+fullname+multi2"
+        ctx = context_len_override or TASK_DEFAULT_CONTEXT["bios"]
+        tok = BioSTokenizer(N=N)
+        ds = build_bios_dataset(N=N, augment=variant, context_len=ctx)
+        return ds, tok.total_vocab, ctx
+    elif task == "bios32":
+        # variant encodes augmentations + optional reverse<N> for inverse search
+        # e.g. "permute", "permute+fullname", "permute+multi2+reverse6"
+        ctx = context_len_override or TASK_DEFAULT_CONTEXT["bios32"]
+        tok = BioS32Tokenizer(N=N)
+        ds = build_bios32_dataset(
+            N=N, augment=variant, context_len=ctx,
+            query_types=bios_query_types,
+            cot_prob=bios_cot_prob,
+        )
+        return ds, tok.total_vocab, ctx
     else:
         raise ValueError(f"Unknown task: {task}")
 
@@ -81,6 +102,8 @@ def train(args):
     dataset, vocab_size, context_len = get_task_config(
         args.task, args.variant, args.N, args.K, args.L,
         context_len_override=args.context_len,
+        bios_query_types=args.bios_query_types,
+        bios_cot_prob=args.bios_cot_prob,
     )
     print(f"Context length: {context_len}")
 
@@ -211,10 +234,11 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train Canon Layers models")
 
     # Task
-    p.add_argument("--task", choices=["depo", "brevo", "mano", "lano", "capo"],
+    p.add_argument("--task", choices=["depo", "brevo", "mano", "lano", "capo", "bios", "bios32"],
                    default="depo", help="Synthetic task")
     p.add_argument("--variant", default="depo1",
-                   help="Task variant (e.g. depo1/depo2, brevo1/brevo2, cfg3f/cfg3j/cfg3k)")
+                   help="Task variant (e.g. depo1/depo2, brevo1/brevo2, cfg3f/cfg3j/cfg3k, "
+                        "or for bios: augmentation string e.g. 'permute', 'permute+fullname+multi2')")
     p.add_argument("--N", type=int, default=225, help="Max graph/permutation size")
     p.add_argument("--K", type=int, default=8, help="Max hop depth (Depo)")
     p.add_argument("--L", type=int, default=10, help="Max expression length (Mano)")
@@ -240,6 +264,12 @@ def parse_args():
     p.add_argument("--no_canon_residual", dest="canon_residual", action="store_false")
     p.add_argument("--tie_weights", action="store_true", default=False,
                    help="Tie embedding and output weights (used for Capo)")
+
+    # BioS32-specific (Part 3.2 knowledge manipulation)
+    p.add_argument("--bios_query_types", default="all",
+                   help="bios32 query types: 'all', 'classify', 'compare', 'inverse', 'extract'")
+    p.add_argument("--bios_cot_prob", type=float, default=0.5,
+                   help="Probability of including CoT hint tokens in bios32 manipulation queries")
 
     # Training
     p.add_argument("--lr", type=float, default=0.001)

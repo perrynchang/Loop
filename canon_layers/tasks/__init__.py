@@ -3,3 +3,8 @@ from .brevo import build_brevo_dataset, BrevoDataset, BrevoTokenizer
 from .mano import build_mano_dataset, ManoDataset, ManoTokenizer, evaluate_mano
 from .lano import build_lano_dataset, LanoDataset, LanoTokenizer, evaluate_lano, CFG_RULES, CFG_ROOTS
 from .capo import build_capo_dataset, CapoDataset
+from .bios import (
+    build_bios_dataset, BioSDataset, BioSTokenizer, ATTR_NAMES,
+    build_bios32_dataset, BioS32Dataset, BioS32Tokenizer,
+    CLASSIFY_TYPES, COMPARE_TYPES, INVERSE_TYPES, ALL_MANIP_TYPES,
+)

@@ -13,6 +13,12 @@ from tasks.depo import DepoTokenizer
 from tasks.brevo import BrevoTokenizer, build_random_dag, topological_reachable
 from tasks.mano import ManoTokenizer, build_expr, eval_expr, serialize_expr, MOD
 from tasks.lano import LanoTokenizer, CFG_RULES, CFG_ROOTS, generate_sentence, is_valid_cfg
+from tasks.bios import (
+    BioSDataset, BioSTokenizer, ATTR_NAMES,
+    BioS32Dataset, BioS32Tokenizer,
+    CLASSIFY_TYPES, COMPARE_TYPES, INVERSE_TYPES,
+    _parse_augment,
+)
 
 
 def load_model(checkpoint_path, device):
@@ -26,6 +32,8 @@ def load_model(checkpoint_path, device):
         'mano': ManoTokenizer().total_vocab,
         'lano': LanoTokenizer().total_vocab,
         'capo': 256,
+        'bios':   BioSTokenizer(N=args.get('N', 1000)).total_vocab,
+        'bios32': BioS32Tokenizer(N=args.get('N', 1000)).total_vocab,
     }
     vocab_size = task_vocab.get(args['task'], 256)
 
@@ -206,15 +214,278 @@ def evaluate_lano(model, variant="cfg3f", n_samples=200, max_gen_len=500, device
     return correct / n_samples
 
 
+@torch.no_grad()
+def evaluate_bios32_classify(model, N=1000, augment="permute", n_samples=500,
+                              with_cot=False, device='cpu'):
+    """
+    Part 3.2 — classification accuracy for each query type.
+
+    with_cot=False: pure answer prediction (no hint; this is the hard case).
+    with_cot=True:  feed the correct attribute value hint before COT_SEP and
+                    check the token immediately after it.
+
+    Returns dict {query_type: accuracy, 'mean': mean}.
+    """
+    ds  = BioS32Dataset(N=N, augment=augment, cot_prob=0.0)
+    tok = ds.tok
+    rng = random.Random(55555)
+    results = defaultdict(list)
+    do_permute, do_fullname, _, _ = _parse_augment(augment)
+
+    for _ in range(n_samples):
+        pid   = rng.randrange(N)
+        attrs = ds.persons[pid]
+        p_tok = tok.person_tok(pid)
+
+        # Biography context
+        blocks = [(tok.bio_mark(name), tok.attr_tok(name, attrs[name])) for name in ATTR_NAMES]
+        if do_permute:
+            rng.shuffle(blocks)
+        bio = [tok.BOS, p_tok]
+        for mark, value in blocks:
+            if do_fullname:
+                bio.append(p_tok)
+            bio.append(mark)
+            bio.append(value)
+
+        for q_type in CLASSIFY_TYPES:
+            if q_type == 'month_even':
+                q_mark   = tok.Q_MONTH_EVEN
+                hint_tok = tok.attr_tok('month', attrs['month'])
+                expected = tok.YES if attrs['month'] % 2 == 0 else tok.NO
+            elif q_type == 'month_mod6':
+                q_mark   = tok.Q_MONTH_MOD6
+                hint_tok = tok.attr_tok('month', attrs['month'])
+                expected = tok.mod6_tok(attrs['month'])
+            elif q_type == 'major_lucky':
+                q_mark   = tok.Q_MAJOR_LUCKY
+                hint_tok = tok.attr_tok('major', attrs['major'])
+                expected = tok.lucky_tok(attrs['major'])
+            elif q_type == 'major_lucky_mod5':
+                q_mark   = tok.Q_MAJOR_LUCKY_MOD5
+                hint_tok = tok.attr_tok('major', attrs['major'])
+                expected = tok.mod5_tok(attrs['major'])
+
+            prefix = bio + [tok.QUERY, q_mark, p_tok]
+            if with_cot:
+                prefix += [hint_tok, tok.COT_SEP]
+
+            x_in   = torch.tensor([prefix], dtype=torch.long, device=device)
+            logits = model(x_in)
+            pred   = logits[0, -1].argmax().item()
+            results[q_type].append(int(pred == expected))
+
+    per_type = {name: (sum(v) / len(v) if v else 0.0) for name, v in results.items()}
+    all_vals = [v for vals in results.values() for v in vals]
+    per_type['mean'] = sum(all_vals) / len(all_vals) if all_vals else 0.0
+    return per_type
+
+
+@torch.no_grad()
+def evaluate_bios32_compare(model, N=1000, augment="permute", n_samples=500,
+                             with_cot=False, device='cpu'):
+    """
+    Part 3.2 — comparison accuracy for each query type.
+
+    Both persons' bios are provided as context. with_cot=True prepends the
+    relevant attribute values (for A and B) before COT_SEP.
+
+    Returns dict {query_type: accuracy, 'mean': mean}.
+    """
+    ds  = BioS32Dataset(N=N, augment=augment, cot_prob=0.0)
+    tok = ds.tok
+    rng = random.Random(44444)
+    results = defaultdict(list)
+    do_permute, do_fullname, _, _ = _parse_augment(augment)
+
+    def _bio(pid):
+        attrs  = ds.persons[pid]
+        p_tok  = tok.person_tok(pid)
+        blocks = [(tok.bio_mark(name), tok.attr_tok(name, attrs[name])) for name in ATTR_NAMES]
+        if do_permute:
+            rng.shuffle(blocks)
+        t = [tok.BOS, p_tok]
+        for mark, value in blocks:
+            if do_fullname:
+                t.append(p_tok)
+            t.append(mark)
+            t.append(value)
+        return t
+
+    for _ in range(n_samples):
+        pid_a = rng.randrange(N)
+        pid_b = rng.randrange(N)
+        while pid_b == pid_a:
+            pid_b = rng.randrange(N)
+
+        attrs_a = ds.persons[pid_a]
+        attrs_b = ds.persons[pid_b]
+        pa, pb  = tok.person_tok(pid_a), tok.person_tok(pid_b)
+        context = _bio(pid_a) + _bio(pid_b)
+
+        for q_type in COMPARE_TYPES:
+            if q_type == 'month_rank':
+                q_mark    = tok.Q_MONTH_RANK
+                hint_toks = [tok.attr_tok('month', attrs_a['month']),
+                             tok.attr_tok('month', attrs_b['month'])]
+                expected  = tok.YES if attrs_a['month'] > attrs_b['month'] else tok.NO
+            elif q_type == 'month_diff':
+                q_mark    = tok.Q_MONTH_DIFF
+                hint_toks = [tok.attr_tok('month', attrs_a['month']),
+                             tok.attr_tok('month', attrs_b['month'])]
+                expected  = tok.month_diff_tok(attrs_a['month'] - attrs_b['month'])
+            elif q_type == 'major_lucky_rank':
+                q_mark    = tok.Q_MAJOR_LUCKY_RANK
+                hint_toks = [tok.lucky_tok(attrs_a['major']),
+                             tok.lucky_tok(attrs_b['major'])]
+                la = tok.major_luckiness[attrs_a['major']]
+                lb = tok.major_luckiness[attrs_b['major']]
+                expected  = tok.YES if la > lb else tok.NO
+            elif q_type == 'major_lucky_diff':
+                q_mark    = tok.Q_MAJOR_LUCKY_DIFF
+                hint_toks = [tok.lucky_tok(attrs_a['major']),
+                             tok.lucky_tok(attrs_b['major'])]
+                diff      = tok.major_luckiness[attrs_a['major']] - tok.major_luckiness[attrs_b['major']]
+                expected  = tok.major_diff_tok(diff)
+
+            prefix = context + [tok.QUERY, q_mark, pa, pb]
+            if with_cot:
+                prefix += hint_toks + [tok.COT_SEP]
+
+            x_in   = torch.tensor([prefix], dtype=torch.long, device=device)
+            logits = model(x_in)
+            pred   = logits[0, -1].argmax().item()
+            results[q_type].append(int(pred == expected))
+
+    per_type = {name: (sum(v) / len(v) if v else 0.0) for name, v in results.items()}
+    all_vals = [v for vals in results.values() for v in vals]
+    per_type['mean'] = sum(all_vals) / len(all_vals) if all_vals else 0.0
+    return per_type
+
+
+@torch.no_grad()
+def evaluate_bios32_inverse(model, N=1000, augment="permute+multi5+reverse6",
+                             n_samples=500, device='cpu'):
+    """
+    Part 3.2 — inverse search accuracy for each query type.
+
+    The bio is provided in the same reverse format used during training.
+    Without 'reverse<N>' in augment this should return ~0% (the paper's main
+    negative result). With reverse6 it can work once the model is trained on
+    reversed biographies.
+
+    Returns dict {query_type: accuracy, 'mean': mean}.
+    """
+    ds  = BioS32Dataset(N=N, augment=augment, cot_prob=0.0)
+    tok = ds.tok
+    rng = random.Random(33333)
+    results = defaultdict(list)
+    do_permute, _, _, reverse_pos = _parse_augment(augment)
+
+    for _ in range(n_samples):
+        pid   = rng.randrange(N)
+        attrs = ds.persons[pid]
+        p_tok = tok.person_tok(pid)
+
+        blocks = [(tok.bio_mark(name), tok.attr_tok(name, attrs[name])) for name in ATTR_NAMES]
+        if do_permute:
+            rng.shuffle(blocks)
+
+        bio = [tok.BOS]
+        if reverse_pos == 0:
+            bio.append(p_tok)
+        for i, (mark, value) in enumerate(blocks):
+            bio.append(mark)
+            bio.append(value)
+            if reverse_pos > 0 and i + 1 == reverse_pos:
+                bio.append(p_tok)
+        if reverse_pos >= len(blocks):
+            bio.append(p_tok)
+
+        for q_type in INVERSE_TYPES:
+            attr_name = q_type[4:]
+            attr_val  = attrs[attr_name]
+            Q_MARK = {
+                'inv_month': tok.Q_INV_MONTH,
+                'inv_city':  tok.Q_INV_CITY,
+                'inv_univ':  tok.Q_INV_UNIV,
+            }
+            prefix   = bio + [tok.QUERY, Q_MARK[q_type], tok.attr_tok(attr_name, attr_val)]
+            expected = p_tok
+
+            x_in   = torch.tensor([prefix], dtype=torch.long, device=device)
+            logits = model(x_in)
+            pred   = logits[0, -1].argmax().item()
+            results[q_type].append(int(pred == expected))
+
+    per_type = {name: (sum(v) / len(v) if v else 0.0) for name, v in results.items()}
+    all_vals = [v for vals in results.values() for v in vals]
+    per_type['mean'] = sum(all_vals) / len(all_vals) if all_vals else 0.0
+    return per_type
+
+
+@torch.no_grad()
+def evaluate_bios(model, N=1000, augment="", n_samples=500, device='cpu'):
+    """
+    Evaluate per-attribute QA accuracy on the BioS knowledge extraction task.
+
+    Presents a full biography (with the specified augmentation) then queries
+    [QUERY][Q_MARK][PERSON] and checks whether the model's argmax equals the
+    correct attribute value token. Mirrors the QA generation accuracy metric
+    from Figure 3 of "Physics of Language Models: Part 3.1".
+
+    Returns dict: {attr_name: accuracy, ..., 'mean': mean_accuracy}
+    """
+    ds  = BioSDataset(N=N, augment=augment)
+    tok = ds.tok
+    rng = random.Random(55555)
+    results = defaultdict(list)
+
+    for _ in range(n_samples):
+        pid   = rng.randrange(N)
+        attrs = ds.persons[pid]
+        p_tok = tok.person_tok(pid)
+
+        # Build bio tokens (same augmentation as training, but no QA appended)
+        blocks = [(tok.bio_mark(name), tok.attr_tok(name, attrs[name]))
+                  for name in ATTR_NAMES]
+        if 'permute' in augment:
+            rng.shuffle(blocks)
+
+        tokens = [tok.BOS, p_tok]
+        for mark, value in blocks:
+            if 'fullname' in augment:
+                tokens.append(p_tok)
+            tokens.append(mark)
+            tokens.append(value)
+
+        # Query one random attribute
+        q_name = rng.choice(ATTR_NAMES)
+        tokens += [tok.QUERY, tok.query_mark(q_name), p_tok]
+
+        x_in   = torch.tensor([tokens], dtype=torch.long, device=device)
+        logits = model(x_in)
+        pred   = logits[0, -1].argmax().item()
+        expected = tok.attr_tok(q_name, attrs[q_name])
+        results[q_name].append(int(pred == expected))
+
+    per_attr = {name: (sum(v) / len(v) if v else 0.0) for name, v in results.items()}
+    all_vals = [v for vals in results.values() for v in vals]
+    per_attr['mean'] = sum(all_vals) / len(all_vals) if all_vals else 0.0
+    return per_attr
+
+
 def main():
     p = argparse.ArgumentParser(description="Evaluate Canon Layers models")
     p.add_argument("checkpoint", help="Path to model checkpoint")
-    p.add_argument("--task", choices=["depo", "brevo", "mano", "lano"])
+    p.add_argument("--task", choices=["depo", "brevo", "mano", "lano", "bios", "bios32"])
     p.add_argument("--variant", default="")
     p.add_argument("--N", type=int, default=225)
     p.add_argument("--K", type=int, default=8)
     p.add_argument("--L", type=int, default=10)
     p.add_argument("--n_samples", type=int, default=200)
+    p.add_argument("--with_cot", action="store_true", default=False,
+                   help="bios32: evaluate with correct CoT hint prepended")
     default_device = "mps" if torch.backends.mps.is_available() else "cpu"
     p.add_argument("--device", default=default_device)
     args = p.parse_args()
@@ -239,6 +510,39 @@ def main():
     elif task == "lano":
         acc = evaluate_lano(model, variant or "cfg3f", args.n_samples, device=device)
         print(f"  CFG validity: {acc*100:.1f}%")
+    elif task == "bios":
+        results = evaluate_bios(model, N=args.N, augment=variant, n_samples=args.n_samples, device=device)
+        mean = results.pop('mean')
+        for attr, acc in results.items():
+            print(f"  {attr:>8s}: {acc*100:.1f}%")
+        print(f"  {'mean':>8s}: {mean*100:.1f}%")
+    elif task == "bios32":
+        N = args.N if args.N != 225 else 1000  # use sensible default for bios
+        cot_label = " (with CoT hint)" if args.with_cot else " (no CoT)"
+
+        print(f"\n--- Classification{cot_label} ---")
+        res = evaluate_bios32_classify(model, N=N, augment=variant,
+                                       n_samples=args.n_samples, with_cot=args.with_cot, device=device)
+        mean = res.pop('mean')
+        for qt, acc in res.items():
+            print(f"  {qt:>20s}: {acc*100:.1f}%")
+        print(f"  {'mean':>20s}: {mean*100:.1f}%")
+
+        print(f"\n--- Comparison{cot_label} ---")
+        res = evaluate_bios32_compare(model, N=N, augment=variant,
+                                      n_samples=args.n_samples, with_cot=args.with_cot, device=device)
+        mean = res.pop('mean')
+        for qt, acc in res.items():
+            print(f"  {qt:>20s}: {acc*100:.1f}%")
+        print(f"  {'mean':>20s}: {mean*100:.1f}%")
+
+        print(f"\n--- Inverse Search ---")
+        res = evaluate_bios32_inverse(model, N=N, augment=variant,
+                                      n_samples=args.n_samples, device=device)
+        mean = res.pop('mean')
+        for qt, acc in res.items():
+            print(f"  {qt:>20s}: {acc*100:.1f}%")
+        print(f"  {'mean':>20s}: {mean*100:.1f}%")
 
 
 if __name__ == "__main__":
