@@ -90,7 +90,7 @@ def evaluate_depo(model, variant="depo1", N=225, K=8, n_samples=200, device='cpu
             for _ in range(k):
                 cur = perm[cur]
 
-            # Build input sequence
+            # Build prompt: edges + query + <ans>
             edges = list(perm.items())
             rng.shuffle(edges)
             tokens = [tok.BOS]
@@ -99,14 +99,22 @@ def evaluate_depo(model, variant="depo1", N=225, K=8, n_samples=200, device='cpu
                 tokens += tok.encode_node(y)
             tokens.append(tok.query_token(k))
             tokens += tok.encode_node(q)
+            tokens.append(tok.ANS)
 
             x_in = torch.tensor([tokens], dtype=torch.long, device=device)
-            logits = model(x_in)
-            pred = logits[0, -1].argmax().item()
 
-            # Expected: first token of answer node encoding
-            expected = tok.encode_node(cur)[0]
-            results[k].append(int(pred == expected))
+            # Greedily decode all answer tokens and check every one matches
+            expected_toks = tok.encode_node(cur)
+            correct = True
+            for exp in expected_toks:
+                logits = model(x_in)
+                pred = logits[0, -1].argmax().item()
+                if pred != exp:
+                    correct = False
+                    break
+                x_in = torch.cat([x_in, torch.tensor([[pred]], device=device)], dim=1)
+
+            results[k].append(int(correct))
 
     return {k: sum(v) / len(v) for k, v in results.items()}
 
