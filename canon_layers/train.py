@@ -8,6 +8,8 @@ import math
 import time
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -32,11 +34,11 @@ TASK_DEFAULT_CONTEXT = {
 
 
 def get_task_config(task, variant, N, K, L, context_len_override=None,
-                    bios_query_types='all', bios_cot_prob=0.5):
+                    bios_query_types='all', bios_cot_prob=0.5, rank=0):
     """Return (dataset, vocab_size, context_len) for a given task."""
     if task == "depo":
         ctx = context_len_override or TASK_DEFAULT_CONTEXT["depo"]
-        ds = build_depo_dataset(variant=variant, N=N, K=K, context_len=ctx)
+        ds = build_depo_dataset(variant=variant, N=N, K=K, context_len=ctx, rank=rank)
         tok = DepoTokenizer(variant)
         return ds, tok.total_vocab, ctx
     elif task == "brevo":
@@ -89,14 +91,30 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr_frac=0.1):
     return max_lr * (min_lr_frac + 0.5 * (1 - min_lr_frac) * (1 + math.cos(math.pi * progress)))
 
 
+def setup_ddp():
+    """Initialize DDP if launched via torchrun, otherwise single-GPU."""
+    if 'RANK' not in os.environ:
+        return 0, 1
+    dist.init_process_group(backend='nccl')
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(rank)
+    return rank, world_size
+
+
 def train(args):
+    rank, world_size = setup_ddp()
+    is_main = (rank == 0)
+
     if torch.cuda.is_available():
-        device = torch.device("cuda")
+        device = torch.device(f'cuda:{rank}')
     elif torch.backends.mps.is_available():
-        device = torch.device("mps")
+        device = torch.device('mps')
     else:
-        device = torch.device("cpu")
-    print(f"Device: {device}")
+        device = torch.device('cpu')
+
+    if is_main:
+        print(f"Device: {device} | World size: {world_size}")
 
     # Build dataset
     dataset, vocab_size, context_len = get_task_config(
@@ -104,13 +122,17 @@ def train(args):
         context_len_override=args.context_len,
         bios_query_types=args.bios_query_types,
         bios_cot_prob=args.bios_cot_prob,
+        rank=rank,
     )
-    print(f"Context length: {context_len}")
+    if is_main:
+        print(f"Context length: {context_len}")
 
-    num_workers = 0 if device.type == "mps" else min(4, os.cpu_count())
+    # Each rank processes batch_size // world_size samples; total = args.batch_size
+    per_gpu_batch = max(1, args.batch_size // world_size)
+    num_workers = 0 if device.type == "mps" else min(2, os.cpu_count())
     dataloader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=per_gpu_batch,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
     )
@@ -141,13 +163,20 @@ def train(args):
             tie_weights=args.tie_weights,
         ).to(device)
 
-    n_params = model.num_parameters()
-    n_canon = count_canon_params(model)
-    print(f"Model parameters: {n_params:,} total, {n_canon:,} Canon ({100*n_canon/n_params:.2f}%)")
-    model_desc = f"{args.model_size} | RoPE={args.rope} | Canon={args.canon}"
-    if use_loop:
-        model_desc += f" | LoopLM T_max={args.T_max} β={args.loop_beta}"
-    print(f"Architecture: {model_desc}")
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank])
+
+    # raw_model is used for parameter counts and checkpoint saving
+    raw_model = model.module if world_size > 1 else model
+
+    if is_main:
+        n_params = raw_model.num_parameters()
+        n_canon = count_canon_params(raw_model)
+        print(f"Model parameters: {n_params:,} total, {n_canon:,} Canon ({100*n_canon/n_params:.2f}%)")
+        model_desc = f"{args.model_size} | RoPE={args.rope} | Canon={args.canon}"
+        if use_loop:
+            model_desc += f" | LoopLM T_max={args.T_max} β={args.loop_beta}"
+        print(f"Architecture: {model_desc}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -162,11 +191,10 @@ def train(args):
     step = 0
     total_loss = 0.0
     log_interval = 100
-    # Extra metrics tracked for LoopLM
     total_entropy = 0.0
     total_avg_exit = 0.0
 
-    pbar = tqdm(total=args.max_steps, desc="Training", unit="step", dynamic_ncols=True)
+    pbar = tqdm(total=args.max_steps, desc="Training", unit="step", dynamic_ncols=True) if is_main else None
     for batch in dataloader:
         if step >= args.max_steps:
             break
@@ -175,20 +203,29 @@ def train(args):
         for pg in optimizer.param_groups:
             pg['lr'] = lr
 
-        x = batch.to(device)
+        if isinstance(batch, (list, tuple)):
+            x, ans_mask = batch[0].to(device), batch[1].to(device)
+        else:
+            x, ans_mask = batch.to(device), None
+
         inputs = x[:, :-1]
         targets = x[:, 1:]
 
-        if use_loop:
-            loss, metrics = model.loop_loss(inputs, targets, beta=args.loop_beta)
-            total_entropy += metrics['entropy']
-            total_avg_exit += metrics['avg_exit_step']
-        else:
-            logits = model(inputs)
-            loss = nn.functional.cross_entropy(
-                logits.reshape(-1, vocab_size),
-                targets.reshape(-1),
-            )
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            if use_loop:
+                loss, metrics = model.loop_loss(inputs, targets, beta=args.loop_beta)
+                total_entropy += metrics['entropy']
+                total_avg_exit += metrics['avg_exit_step']
+            else:
+                logits = model(inputs)
+                if ans_mask is not None:
+                    labels = targets.masked_fill(~ans_mask[:, 1:], -100)
+                else:
+                    labels = targets
+                loss = nn.functional.cross_entropy(
+                    logits.reshape(-1, vocab_size),
+                    labels.reshape(-1),
+                )
 
         optimizer.zero_grad()
         loss.backward()
@@ -197,9 +234,10 @@ def train(args):
 
         total_loss += loss.item()
         step += 1
-        pbar.update(1)
+        if is_main:
+            pbar.update(1)
 
-        if step % log_interval == 0:
+        if is_main and step % log_interval == 0:
             avg_loss = total_loss / log_interval
             if use_loop:
                 avg_ent = total_entropy / log_interval
@@ -216,18 +254,21 @@ def train(args):
                 pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
             total_loss = 0.0
 
-    pbar.close()
+    if is_main:
+        pbar.close()
+        if args.save_path:
+            os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+            torch.save({
+                'step': step,
+                'model_state': raw_model.state_dict(),
+                'args': vars(args),
+            }, args.save_path)
+            print(f"Saved checkpoint to {args.save_path}")
 
-    if args.save_path:
-        os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        torch.save({
-            'step': step,
-            'model_state': model.state_dict(),
-            'args': vars(args),
-        }, args.save_path)
-        print(f"Saved checkpoint to {args.save_path}")
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
-    return model
+    return raw_model
 
 
 def parse_args():

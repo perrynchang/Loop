@@ -1,11 +1,13 @@
 """
 Task Depo: Mental Reasoning Depth
 k-hop traversal over directed permutations.
-Format: <bos> x1 y1 x2 y2 ... xn yn <query_k1> q1 a1 <query_k2> q2 a2 ... <eos>
+Format: <bos> x1 y1 x2 y2 ... xn yn <query_k1> q1 <ans> a1 <query_k2> q2 <ans> a2 ...
 """
+import math
 import random
 import torch
-from torch.utils.data import Dataset, IterableDataset
+import torch.distributed as dist
+from torch.utils.data import IterableDataset
 
 
 class DepoTokenizer:
@@ -17,27 +19,39 @@ class DepoTokenizer:
             self.vocab_size = 50
             self.node_min_len = 1
             self.node_max_len = 2
-        else:  # depo2
+        else:  # depo2 — word-boundary encoding doubles effective node vocab
             self.vocab_size = 4
             self.node_min_len = 5
             self.node_max_len = 7
 
-        # Special tokens
+        # Special tokens: <bos>=0, <ans>=1, then node vocab, then <query_k> tokens
         self.BOS = 0
-        self.EOS = 1
-        self.NODE_VOCAB_OFFSET = 2  # node tokens start here
-        # Query tokens: one per hop depth k=1..K_max
+        self.ANS = 1
+        self.NODE_VOCAB_OFFSET = 2
+        # Depo2 uses 2*vocab_size node token IDs (word-boundary encoding)
+        node_vocab = self.vocab_size * 2 if variant == "depo2" else self.vocab_size
         self.K_MAX = 16
-        self.QUERY_OFFSET = self.NODE_VOCAB_OFFSET + self.vocab_size
-        # Total vocab: BOS, EOS, node_vocab, query_k tokens
+        self.QUERY_OFFSET = self.NODE_VOCAB_OFFSET + node_vocab
         self.total_vocab = self.QUERY_OFFSET + self.K_MAX + 1
 
     def encode_node(self, node_id):
-        """Encode a node as a sequence of tokens."""
-        length = random.randint(self.node_min_len, self.node_max_len)
-        # Use node_id as seed so each node always encodes the same way in one instance
+        """Encode a node as a sequence of tokens.
+
+        Both length and content are seeded from node_id so every call with the
+        same node_id returns the identical token sequence within one instance.
+        """
         rng = random.Random(node_id)
-        return [self.NODE_VOCAB_OFFSET + rng.randint(0, self.vocab_size - 1) for _ in range(length)]
+        length = rng.randint(self.node_min_len, self.node_max_len)
+        if self.variant == "depo2" and length > 1:
+            # Word-boundary encoding: first length-1 tokens from [0, V-1],
+            # final token from [V, 2V-1] to create implicit word boundaries.
+            toks = [self.NODE_VOCAB_OFFSET + rng.randint(0, self.vocab_size - 1)
+                    for _ in range(length - 1)]
+            toks.append(self.NODE_VOCAB_OFFSET + self.vocab_size +
+                        rng.randint(0, self.vocab_size - 1))
+            return toks
+        return [self.NODE_VOCAB_OFFSET + rng.randint(0, self.vocab_size - 1)
+                for _ in range(length)]
 
     def query_token(self, k):
         return self.QUERY_OFFSET + k
@@ -48,75 +62,112 @@ class DepoDataset(IterableDataset):
     Generates Depo task instances on-the-fly.
 
     Each instance:
-      <bos> x1_toks y1_toks x2_toks y2_toks ... xn_toks yn_toks
-      <query_k1> q1_toks a1_toks <query_k2> q2_toks a2_toks ... <eos>
+      <bos> x1_toks y1_toks ... xn_toks yn_toks
+      <query_k1> q1_toks <ans> a1_toks ... (t = min(10, n) queries)
 
-    The permutation is a bijection perm: [0..n-1] -> [0..n-1].
-    Edge xi->yi means node xi maps to yi (1-hop successor).
-    The k-th successor of a query node q is the answer.
+    Instances are concatenated and left-aligned into context_len windows.
+    Yields (tokens, answer_mask) where answer_mask=1 for <ans> and answer tokens.
     """
 
-    def __init__(self, N, K, variant="depo1", context_len=2048,
-                 n_queries_per_instance=4, seed=42):
+    def __init__(self, N, K, variant="depo1", context_len=2048, seed=42, rank=0):
         super().__init__()
         self.N = N
         self.K = K
         self.tokenizer = DepoTokenizer(variant)
         self.context_len = context_len
-        self.n_queries = n_queries_per_instance
-        self.seed = seed
+        self.seed = seed + rank * 10000
+
+        # Precompute CDF for curriculum sampling n ∝ 1/√(N+n)
+        ns = list(range(3, N + 1))
+        w = [1.0 / math.sqrt(N + n) for n in ns]
+        total = sum(w)
+        self._sample_ns = ns
+        self._sample_cdf = []
+        s = 0.0
+        for wi in w:
+            s += wi / total
+            self._sample_cdf.append(s)
+
+    def _sample_n(self, rng):
+        """Sample n ∝ 1/√(N+n) via binary search on precomputed CDF."""
+        r = rng.random()
+        lo, hi = 0, len(self._sample_cdf) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._sample_cdf[mid] < r:
+                lo = mid + 1
+            else:
+                hi = mid
+        return self._sample_ns[lo]
 
     def _make_instance(self, rng):
+        """Return (tokens, answer_mask) for one problem instance."""
         tok = self.tokenizer
-        n = rng.randint(3, self.N)
+        n = self._sample_n(rng)
 
-        # Build random permutation (directed cycle cover)
+        # Build random permutation (single directed cycle)
         nodes = list(range(n))
         rng.shuffle(nodes)
-        perm = {}  # perm[x] = y means x -> y
-        for i in range(n):
-            perm[nodes[i]] = nodes[(i + 1) % n]
+        perm = {nodes[i]: nodes[(i + 1) % n] for i in range(n)}
 
         # Encode edges in random order
         edges = list(perm.items())
         rng.shuffle(edges)
 
         tokens = [tok.BOS]
+        mask = [0]
         for x, y in edges:
-            tokens += tok.encode_node(x)
-            tokens += tok.encode_node(y)
+            xt, yt = tok.encode_node(x), tok.encode_node(y)
+            tokens += xt + yt
+            mask += [0] * (len(xt) + len(yt))
 
-        # Generate queries
-        for _ in range(self.n_queries):
+        # t = min(10, n) queries per instance
+        for _ in range(min(10, n)):
             k = rng.randint(1, self.K)
             q = rng.choice(nodes)
-
-            # Compute k-th successor
             cur = q
             for _ in range(k):
                 cur = perm[cur]
 
-            tokens.append(tok.query_token(k))
-            tokens += tok.encode_node(q)
-            tokens += tok.encode_node(cur)
+            q_toks = tok.encode_node(q)
+            a_toks = tok.encode_node(cur)
+            tokens += [tok.query_token(k)] + q_toks + [tok.ANS] + a_toks
+            mask += [0] * (1 + len(q_toks))   # query token + query node: not in loss
+            mask += [1] + [1] * len(a_toks)    # <ans> + answer tokens: in loss
 
-        tokens.append(tok.EOS)
-        return tokens
+        return tokens, mask
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         seed = self.seed + (worker_info.id if worker_info else 0)
         rng = random.Random(seed)
+        tok = self.tokenizer
 
-        buffer = []
+        token_buf, mask_buf = [], []
         while True:
-            inst = self._make_instance(rng)
-            buffer.extend(inst)
-            while len(buffer) >= self.context_len:
-                chunk = buffer[:self.context_len]
-                buffer = buffer[self.context_len:]
-                yield torch.tensor(chunk, dtype=torch.long)
+            toks, mask = self._make_instance(rng)
+            token_buf.extend(toks)
+            mask_buf.extend(mask)
+
+            while len(token_buf) >= self.context_len:
+                chunk_toks = token_buf[:self.context_len]
+                chunk_mask = mask_buf[:self.context_len]
+                rest_toks = token_buf[self.context_len:]
+                rest_mask = mask_buf[self.context_len:]
+
+                # Left-align next chunk: discard partial instance tail up to next BOS
+                next_bos = next((i for i, t in enumerate(rest_toks) if t == tok.BOS), None)
+                if next_bos is None:
+                    token_buf, mask_buf = [], []
+                else:
+                    token_buf = rest_toks[next_bos:]
+                    mask_buf = rest_mask[next_bos:]
+
+                yield (
+                    torch.tensor(chunk_toks, dtype=torch.long),
+                    torch.tensor(chunk_mask, dtype=torch.bool),
+                )
 
 
-def build_depo_dataset(variant="depo1", N=225, K=8, context_len=2048, seed=42):
-    return DepoDataset(N, K, variant, context_len, seed=seed)
+def build_depo_dataset(variant="depo1", N=225, K=8, context_len=2048, seed=42, rank=0):
+    return DepoDataset(N, K, variant, context_len, seed=seed, rank=rank)
