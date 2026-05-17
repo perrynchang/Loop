@@ -96,13 +96,8 @@ class CausalSelfAttention(nn.Module):
         if self.rope is not None:
             q, k = self.rope(q, k, T)
 
-        # Scaled dot-product attention with causal mask
-        scale = math.sqrt(self.head_dim)
-        attn = torch.matmul(q, k.transpose(-2, -1)) / scale
-        attn = attn.masked_fill(self.mask[:T, :T].bool().logical_not(), float('-inf'))
-        attn = F.softmax(attn, dim=-1)
-
-        out = torch.matmul(attn, v)  # (B, n_heads, T, head_dim)
+        # Flash attention — avoids materialising the full (B, H, T, T) matrix
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(out)
 
