@@ -279,8 +279,8 @@ def build_transformer(
     # For Llama, intermediate_size = 8d/3 * 2 ≈ 5.33d (rounded), but paper sets it so
     # MLP has 8d^2 params; with gate+up+down that's 2*d*I + I*d = 3*I*d = 8d^2 => I = 8d/3
     intermediate_size = int(8 * d_model / 3)
-    # Round to multiple of 64
-    intermediate_size = (intermediate_size + 63) // 64 * 64
+    # Round to multiple of 256, matching author's implementation
+    intermediate_size = (intermediate_size + 255) // 256 * 256
 
     return TransformerLM(
         vocab_size=vocab_size,

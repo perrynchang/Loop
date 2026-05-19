@@ -28,10 +28,9 @@ class DepoTokenizer:
         self.BOS = 0
         self.ANS = 1
         self.NODE_VOCAB_OFFSET = 2
-        # Depo2 uses 2*vocab_size node token IDs (word-boundary encoding)
-        node_vocab = self.vocab_size * 2 if variant == "depo2" else self.vocab_size
+        # Both depo1 and depo2 use word-boundary encoding: 2*vocab_size node token IDs
         self.K_MAX = 16
-        self.QUERY_OFFSET = self.NODE_VOCAB_OFFSET + node_vocab
+        self.QUERY_OFFSET = self.NODE_VOCAB_OFFSET + self.vocab_size * 2
         self.total_vocab = self.QUERY_OFFSET + self.K_MAX + 1
 
     def encode_node(self, node_id):
@@ -39,19 +38,18 @@ class DepoTokenizer:
 
         Both length and content are seeded from node_id so every call with the
         same node_id returns the identical token sequence within one instance.
+        Word-boundary encoding: inner tokens from [0, V-1], final token from [V, 2V-1].
         """
         rng = random.Random(node_id)
         length = rng.randint(self.node_min_len, self.node_max_len)
-        if self.variant == "depo2" and length > 1:
-            # Word-boundary encoding: first length-1 tokens from [0, V-1],
-            # final token from [V, 2V-1] to create implicit word boundaries.
+        if length > 1:
             toks = [self.NODE_VOCAB_OFFSET + rng.randint(0, self.vocab_size - 1)
                     for _ in range(length - 1)]
             toks.append(self.NODE_VOCAB_OFFSET + self.vocab_size +
                         rng.randint(0, self.vocab_size - 1))
             return toks
-        return [self.NODE_VOCAB_OFFSET + rng.randint(0, self.vocab_size - 1)
-                for _ in range(length)]
+        # length == 1: single token acts as its own boundary token
+        return [self.NODE_VOCAB_OFFSET + self.vocab_size + rng.randint(0, self.vocab_size - 1)]
 
     def query_token(self, k):
         return self.QUERY_OFFSET + k
@@ -77,9 +75,9 @@ class DepoDataset(IterableDataset):
         self.context_len = context_len
         self.seed = seed + rank * 10000
 
-        # Precompute CDF for curriculum sampling n ∝ 1/√(N+n)
+        # Precompute CDF for curriculum sampling n ∝ 1/(n + √N), matching author's distribution
         ns = list(range(3, N + 1))
-        w = [1.0 / math.sqrt(N + n) for n in ns]
+        w = [1.0 / (n + math.sqrt(N) + 1e-12) for n in ns]
         total = sum(w)
         self._sample_ns = ns
         self._sample_cdf = []
@@ -89,7 +87,7 @@ class DepoDataset(IterableDataset):
             self._sample_cdf.append(s)
 
     def _sample_n(self, rng):
-        """Sample n ∝ 1/√(N+n) via binary search on precomputed CDF."""
+        """Sample n ∝ 1/(n+√N) via binary search on precomputed CDF."""
         r = rng.random()
         lo, hi = 0, len(self._sample_cdf) - 1
         while lo < hi:

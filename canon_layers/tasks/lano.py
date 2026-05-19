@@ -73,32 +73,32 @@ def generate_sentence(rules, root, rng, max_len=2000):
 
 def is_valid_cfg(tokens, rules, root):
     """
-    Validate a token sequence against a CFG using CYK-style DP.
+    Validate a token sequence against a CFG.
     Returns True if the sequence can be derived from root.
-    Simplified: just check by trying to parse.
+    Uses full backtracking to handle ambiguous grammars correctly.
     """
-    # For simplicity, use recursive descent parsing
-    # (the paper uses O(n^3) DP; for validation we'll use a simpler check)
-    pos = [0]
-
-    def parse(sym):
+    def parse(sym, pos):
+        """Return the set of all possible end positions after parsing sym from pos."""
         if sym in TERMINAL_SYMBOLS:
-            if pos[0] < len(tokens) and tokens[pos[0]] == sym:
-                pos[0] += 1
-                return True
-            return False
+            if pos < len(tokens) and tokens[pos] == sym:
+                return {pos + 1}
+            return set()
         if sym not in rules:
-            return False
-        start = pos[0]
+            return set()
+        ends = set()
         for expansion in rules[sym]:
-            pos[0] = start
-            if all(parse(s) for s in expansion):
-                return True
-        pos[0] = start
-        return False
+            positions = {pos}
+            for s in expansion:
+                next_positions = set()
+                for p in positions:
+                    next_positions |= parse(s, p)
+                positions = next_positions
+                if not positions:
+                    break
+            ends |= positions
+        return ends
 
-    result = parse(root)
-    return result and pos[0] == len(tokens)
+    return len(tokens) in parse(root, 0)
 
 
 class LanoTokenizer:
