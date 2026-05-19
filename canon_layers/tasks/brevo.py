@@ -87,7 +87,10 @@ class BrevoDataset(IterableDataset):
 
     def _make_instance(self, rng):
         tok = self.tokenizer
-        n = rng.randint(3, self.N)
+        # Curriculum: n ∝ 1/(n + √N), matching author's distribution
+        ns = list(range(3, self.N + 1))
+        w = [1.0 / (n + self.N ** 0.5 + 1e-12) for n in ns]
+        n = rng.choices(ns, weights=w)[0]
         edges = build_random_dag(n, max_degree=4, rng=rng)
 
         # Build children map

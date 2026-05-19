@@ -35,7 +35,7 @@ $HOME/.conda/envs/my_env/bin/torchrun --nproc_per_node=4 train.py \
     --model_size 8L512D \
     --rope rope \
     --rope_fraction 1.0 \
-    --lr 0.001 \
+    --lr 0.0003 \
     --weight_decay 0.03 \
     --batch_size 128 \
     --max_steps 87500 \
