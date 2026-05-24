@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from collections import defaultdict
 
 from models import build_transformer, build_loop_transformer
-from tasks.depo import DepoTokenizer
+from tasks.depo import DepoTokenizer, generate_node_words
 from tasks.brevo import BrevoTokenizer, build_random_dag, topological_reachable
 from tasks.mano import ManoTokenizer, build_expr, eval_expr, serialize_expr, MOD
 from tasks.lano import LanoTokenizer, CFG_RULES, CFG_ROOTS, generate_sentence, is_valid_cfg
@@ -18,6 +18,12 @@ from tasks.bios import (
     BioS32Dataset, BioS32Tokenizer,
     CLASSIFY_TYPES, COMPARE_TYPES, INVERSE_TYPES,
     _parse_augment,
+)
+from tasks.capo import (
+    _generate_attrs, _generate_text, _get_tokenizer, _get_compact_vocab,
+    get_capo_vocab_size, CAPO_VOCAB_SIZE,
+    FIRST_NAMES, MIDDLE_NAMES, LAST_NAMES, CITIES,
+    EMPLOYERS, UNIVERSITIES, MAJORS, BIRTH_MONTHS, BIRTH_DAYS, BIRTH_YEARS,
 )
 
 
@@ -31,7 +37,7 @@ def load_model(checkpoint_path, device):
         'brevo': BrevoTokenizer(args.get('variant', 'brevo1')).total_vocab,
         'mano': ManoTokenizer().total_vocab,
         'lano': LanoTokenizer().total_vocab,
-        'capo': 256,
+        'capo': get_capo_vocab_size(),
         'bios':   BioSTokenizer(N=args.get('N', 1000)).total_vocab,
         'bios32': BioS32Tokenizer(N=args.get('N', 1000)).total_vocab,
     }
@@ -58,6 +64,7 @@ def load_model(checkpoint_path, device):
             canon_positions=args.get('canon', ''),
             canon_residual=args.get('canon_residual', True),
             max_seq_len=2048,
+            tie_weights=args.get('tie_weights', False),
         )
 
     state = {k: v for k, v in ckpt['model_state'].items()
@@ -69,54 +76,71 @@ def load_model(checkpoint_path, device):
 
 
 @torch.no_grad()
-def evaluate_depo(model, variant="depo1", N=225, K=8, n_samples=200, device='cpu'):
+def evaluate_depo(model, variant="depo1", N=225, K=8, n_samples=50, device='cpu',
+                  context_len=2048):
     """
-    Evaluate k-hop reasoning depth on Depo task.
-    Returns dict: {k: accuracy} for k in [1, K].
+    Evaluate k-hop reasoning depth on Depo (teacher-forcing, packed windows).
+
+    Matches the paper protocol (Appendix A.1): n=N fixed, instances packed into
+    context_len windows, accuracy computed over all <ans>/answer-token positions
+    via a single forward pass (teacher-forcing). Evaluated at k=K and k=K//2.
+
+    Returns {k: accuracy} for k in {K//2, K}.
     """
     tok = DepoTokenizer(variant)
     rng = random.Random(99999)
-    results = defaultdict(list)
+    correct = defaultdict(int)
+    total   = defaultdict(int)
 
-    for _ in range(n_samples):
-        n = N  # evaluate on hardest case
-        nodes = list(range(n))
-        rng.shuffle(nodes)
-        perm = {nodes[i]: nodes[(i + 1) % n] for i in range(n)}
+    eval_ks = sorted({K // 2, K})
 
-        for k in range(1, K + 1):
-            q = rng.choice(nodes)
-            cur = q
-            for _ in range(k):
-                cur = perm[cur]
+    for target_k in eval_ks:
+        for _ in range(n_samples):
+            token_buf, mask_buf = [], []
 
-            # Build prompt: edges + query + <ans>
-            edges = list(perm.items())
-            rng.shuffle(edges)
-            tokens = [tok.BOS]
-            for x, y in edges:
-                tokens += tok.encode_node(x)
-                tokens += tok.encode_node(y)
-            tokens.append(tok.query_token(k))
-            tokens += tok.encode_node(q)
-            tokens.append(tok.ANS)
+            # Pack complete instances until the buffer covers a full window.
+            # Left-alignment: first instance is never truncated.
+            while len(token_buf) < context_len:
+                word_list = generate_node_words(rng, N, tok)
+                nodes = list(range(N))
+                rng.shuffle(nodes)
+                perm = {nodes[i]: nodes[(i + 1) % N] for i in range(N)}
 
-            x_in = torch.tensor([tokens], dtype=torch.long, device=device)
+                edges = list(perm.items())
+                rng.shuffle(edges)
+                inst_toks = [tok.BOS]
+                inst_mask = [0]
+                for x, y in edges:
+                    xt, yt = word_list[x], word_list[y]
+                    inst_toks += xt + yt
+                    inst_mask += [0] * (len(xt) + len(yt))
 
-            # Greedily decode all answer tokens and check every one matches
-            expected_toks = tok.encode_node(cur)
-            correct = True
-            for exp in expected_toks:
-                logits = model(x_in)
-                pred = logits[0, -1].argmax().item()
-                if pred != exp:
-                    correct = False
-                    break
-                x_in = torch.cat([x_in, torch.tensor([[pred]], device=device)], dim=1)
+                for q in rng.sample(nodes, min(10, N)):
+                    cur = q
+                    for _ in range(target_k):
+                        cur = perm[cur]
+                    q_toks = word_list[q]
+                    a_toks = word_list[cur]
+                    inst_toks += [tok.query_token(target_k)] + q_toks + [tok.ANS] + a_toks
+                    inst_mask += [0] * (1 + len(q_toks)) + [1] * (1 + len(a_toks))
 
-            results[k].append(int(correct))
+                token_buf.extend(inst_toks)
+                mask_buf.extend(inst_mask)
 
-    return {k: sum(v) / len(v) for k, v in results.items()}
+            chunk_toks = token_buf[:context_len]
+            chunk_mask = mask_buf[:context_len]
+
+            x = torch.tensor([chunk_toks], dtype=torch.long, device=device)
+            logits = model(x)  # (1, context_len, vocab)
+
+            # Teacher-forcing: at each masked position p, logits[p-1] predicts token[p].
+            for p in range(1, context_len):
+                if chunk_mask[p]:
+                    pred = logits[0, p - 1].argmax().item()
+                    correct[target_k] += int(pred == chunk_toks[p])
+                    total[target_k]   += 1
+
+    return {k: (correct[k] / total[k] if total[k] > 0 else 0.0) for k in eval_ks}
 
 
 @torch.no_grad()
@@ -176,24 +200,42 @@ def evaluate_brevo(model, variant="brevo1", N=70, n_samples=100, device='cpu'):
 
 
 @torch.no_grad()
-def evaluate_mano(model, L=10, n_samples=500, device='cpu'):
-    """Evaluate modular arithmetic accuracy at max length L."""
+def evaluate_mano(model, L=10, n_samples=500, device='cpu', context_len=1024):
+    """
+    Evaluate accuracy on packed 1024-token context windows.
+    Matches the paper's protocol: l=L expressions are packed end-to-end and
+    accuracy is computed over all instances including non-first ones (~40/window at L=10).
+    """
     tok = ManoTokenizer()
     rng = random.Random(77777)
     correct = 0
+    total = 0
 
     for _ in range(n_samples):
-        tree = build_expr(L, rng)
-        expected = eval_expr(tree) % MOD
-        expr_toks = serialize_expr(tree)
+        buffer = []
+        ans_targets = []  # (ans_token_position, expected_val_token)
 
-        prefix = [tok.BOS, tok.len_token(L)] + tok.encode_expr(expr_toks) + [tok.ANS]
-        x_in = torch.tensor([prefix], dtype=torch.long, device=device)
-        logits = model(x_in)
-        pred = logits[0, -1].argmax().item()
-        correct += int(pred == tok.val_token(expected))
+        while len(buffer) < context_len:
+            tree = build_expr(L, rng)
+            result = eval_expr(tree) % MOD
+            expr_toks = serialize_expr(tree)
+            instance = ([tok.BOS, tok.len_token(L)]
+                        + tok.encode_expr(expr_toks)
+                        + [tok.ans_token(L), tok.val_token(result), tok.EOS])
+            ans_pos = len(buffer) + len(instance) - 3
+            buffer.extend(instance)
+            if ans_pos < context_len:
+                ans_targets.append((ans_pos, tok.val_token(result)))
 
-    return correct / n_samples
+        chunk = torch.tensor([buffer[:context_len]], dtype=torch.long, device=device)
+        logits = model(chunk)  # (1, context_len, vocab_size)
+
+        for ans_pos, expected in ans_targets:
+            pred = logits[0, ans_pos].argmax().item()
+            correct += int(pred == expected)
+            total += 1
+
+    return correct / total if total > 0 else 0.0
 
 
 @torch.no_grad()
@@ -483,10 +525,139 @@ def evaluate_bios(model, N=1000, augment="", n_samples=500, device='cpu'):
     return per_attr
 
 
+@torch.no_grad()
+def evaluate_capo(model, checkpoint_args, N_eval=1000, device='cpu'):
+    """
+    Evaluate Capo knowledge memorization.
+
+    For N_eval people from the training set, generates a held-out paraphrase
+    (exposure index 100, unseen during training which used indices 0-99), then:
+      1. Computes NLL loss on each bio.
+      2. For each of the 6 attribute types, finds the attribute value's first
+         token position in the tokenized text and checks whether the model's
+         argmax at that position is correct.
+      3. Estimates bits-per-parameter (BPP) from per-attribute accuracy.
+
+    Returns a dict with loss, per-attribute accuracy, mean accuracy, and BPP.
+    """
+    import math
+    N    = checkpoint_args.get('N', 50000)
+    seed = 42
+    tok  = _get_tokenizer()
+    gpt2_to_compact, _, compact_vocab_size = _get_compact_vocab()
+
+    # Rebuild training attributes with identical seed used in CapoDataset
+    rng_attrs = random.Random(seed)
+    all_attrs = [_generate_attrs(rng_attrs, i) for i in range(N)]
+
+    # Sample N_eval random persons
+    eval_rng = random.Random(98765)
+    eval_pids = eval_rng.sample(range(N), min(N_eval, N))
+
+    losses = []
+    attr_correct = defaultdict(int)
+    attr_total   = defaultdict(int)
+
+    ATTR_KEYS = ['birthday', 'birthcity', 'university', 'field', 'company1name', 'company1city']
+
+    for pid in eval_pids:
+        attrs   = all_attrs[pid]
+        # Exposure 100 was never seen during training (training used 0–99)
+        exp_rng = random.Random(seed + pid * 100 + 100)
+        text    = _generate_text(attrs, exp_rng)
+
+        # Tokenize with character-to-token offset mapping, then remap to compact IDs
+        enc     = tok(text, return_offsets_mapping=True)
+        gpt2_ids = enc['input_ids']
+        offsets  = enc['offset_mapping']
+        tokens   = [gpt2_to_compact[t] for t in gpt2_ids]
+
+        if len(tokens) < 2:
+            continue
+
+        t = torch.tensor([tokens], dtype=torch.long, device=device)
+
+        # NLL on the full bio
+        logits = model(t[:, :-1])
+        loss   = F.cross_entropy(logits.reshape(-1, compact_vocab_size), t[:, 1:].reshape(-1))
+        losses.append(loss.item())
+
+        # Pre-compute argmax predictions at every position
+        preds = logits[0].argmax(dim=-1)  # shape (T-1,)
+
+        # Build attribute value strings exactly as they appear in the bio
+        birthday_str = f"{attrs['birthmonth']} {attrs['birthday']}, {attrs['birthyear']}"
+        attr_vals = {
+            'birthday':     birthday_str,
+            'birthcity':    attrs['birthcity'],
+            'university':   attrs['university'],
+            'field':        attrs['field'],
+            'company1name': attrs['company1name'],
+            'company1city': attrs['company1city'],
+        }
+
+        for attr_key, attr_val in attr_vals.items():
+            char_pos = text.find(str(attr_val))
+            if char_pos == -1:
+                continue
+
+            # Map character position → first token index of the attribute value
+            token_pos = next(
+                (i for i, (start, _) in enumerate(offsets) if start >= char_pos),
+                None,
+            )
+            if token_pos is None or token_pos == 0 or token_pos >= len(tokens):
+                continue
+
+            expected  = tokens[token_pos]
+            predicted = preds[token_pos - 1].item()
+            attr_correct[attr_key] += int(predicted == expected)
+            attr_total[attr_key]   += 1
+
+    mean_loss   = sum(losses) / len(losses) if losses else float('inf')
+
+    per_attr_acc = {k: attr_correct[k] / attr_total[k]
+                    for k in ATTR_KEYS if attr_total[k] > 0}
+    mean_acc     = sum(per_attr_acc.values()) / len(per_attr_acc) if per_attr_acc else 0.0
+
+    # Theoretical bits per person (all independent attributes)
+    bits_per_person = (
+        math.log2(len(FIRST_NAMES)) + math.log2(len(MIDDLE_NAMES)) + math.log2(len(LAST_NAMES)) +
+        math.log2(len(BIRTH_MONTHS) * len(BIRTH_DAYS) * len(BIRTH_YEARS)) +
+        math.log2(len(CITIES)) + math.log2(len(UNIVERSITIES)) +
+        math.log2(len(MAJORS))  + math.log2(len(EMPLOYERS))
+    )
+
+    # BPP using queried attributes only (birthday, birthcity, university, field, company)
+    queried_bits = (
+        math.log2(len(BIRTH_MONTHS) * len(BIRTH_DAYS) * len(BIRTH_YEARS)) +
+        math.log2(len(CITIES)) + math.log2(len(UNIVERSITIES)) +
+        math.log2(len(MAJORS))  + math.log2(len(EMPLOYERS))
+    )
+    # Deduplicate tied weights (embedding == lm_head) before counting
+    seen_ptrs = set()
+    n_params = 0
+    for p in model.parameters():
+        if p.data_ptr() not in seen_ptrs:
+            seen_ptrs.add(p.data_ptr())
+            n_params += p.numel()
+    bpp      = N * queried_bits * mean_acc / n_params
+
+    return {
+        'mean_loss':              mean_loss,
+        'per_attr_accuracy':      per_attr_acc,
+        'mean_accuracy':          mean_acc,
+        'bits_per_person':        bits_per_person,
+        'queried_bits_per_person': queried_bits,
+        'bpp_estimate':           bpp,
+        'n_params':               n_params,
+    }
+
+
 def main():
     p = argparse.ArgumentParser(description="Evaluate Canon Layers models")
     p.add_argument("checkpoint", help="Path to model checkpoint")
-    p.add_argument("--task", choices=["depo", "brevo", "mano", "lano", "bios", "bios32"])
+    p.add_argument("--task", choices=["depo", "brevo", "mano", "lano", "capo", "bios", "bios32"])
     p.add_argument("--variant", default="")
     p.add_argument("--N", type=int, default=225)
     p.add_argument("--K", type=int, default=8)
@@ -515,6 +686,17 @@ def main():
     elif task == "mano":
         acc = evaluate_mano(model, args.L, args.n_samples, device)
         print(f"  Accuracy (L={args.L}): {acc*100:.1f}%")
+    elif task == "capo":
+        results = evaluate_capo(model, train_args, N_eval=args.n_samples, device=device)
+        print(f"  Test NLL (held-out paraphrase): {results['mean_loss']:.4f}")
+        print(f"  Per-attribute first-token accuracy:")
+        for attr, acc in results['per_attr_accuracy'].items():
+            print(f"    {attr:>12s}: {acc*100:.1f}%")
+        print(f"  Mean accuracy:         {results['mean_accuracy']*100:.1f}%")
+        print(f"  Bits/person (theory):  {results['bits_per_person']:.2f} bits")
+        print(f"  Queried bits/person:   {results['queried_bits_per_person']:.2f} bits")
+        print(f"  Model parameters:      {results['n_params']:,}")
+        print(f"  Estimated BPP:         {results['bpp_estimate']:.4f} bits/param")
     elif task == "lano":
         acc = evaluate_lano(model, variant or "cfg3f", args.n_samples, device=device)
         print(f"  CFG validity: {acc*100:.1f}%")

@@ -135,6 +135,7 @@ class LoopLM(nn.Module):
         targets: torch.Tensor,
         beta: float = 0.1,
         T: int = None,
+        ans_mask: torch.Tensor = None,
     ):
         """
         Stage I entropy-regularized training loss (Equation 4 of the paper).
@@ -142,10 +143,11 @@ class LoopLM(nn.Module):
           L = Σ_t [p_ϕ(t|x) · L(t)] − β · H(p_ϕ(·|x))
 
         Args:
-            x:       (B, seq_len) input token ids
-            targets: (B, seq_len) target token ids
-            beta:    KL/entropy coefficient (uniform prior → entropy regularisation)
-            T:       number of recurrent steps (default: T_max)
+            x:        (B, seq_len) input token ids
+            targets:  (B, seq_len) target token ids
+            beta:     KL/entropy coefficient (uniform prior → entropy regularisation)
+            T:        number of recurrent steps (default: T_max)
+            ans_mask: (B, seq_len+1) bool mask — loss computed only where True (e.g. Depo/Capo)
 
         Returns:
             total_loss: scalar tensor
@@ -154,6 +156,14 @@ class LoopLM(nn.Module):
         T = T or self.T_max
         B, seq = targets.shape
         V = self.vocab_size
+
+        # Apply answer mask to targets: positions outside the mask contribute 0 loss
+        if ans_mask is not None:
+            targets = targets.masked_fill(~ans_mask[:, 1:], -100)
+
+        # Number of valid (non-masked) positions per example for correct averaging.
+        # For unmasked tasks n_valid == seq, so sum/n_valid == mean.
+        n_valid = (targets != -100).float().sum(dim=1).clamp(min=1)  # (B,)
 
         # --- forward through all T loops ---
         h = self.embedding(x)
@@ -181,8 +191,9 @@ class LoopLM(nn.Module):
             loss_t = F.cross_entropy(
                 logits_t.reshape(-1, V),
                 targets.reshape(-1),
+                ignore_index=-100,
                 reduction='none',
-            ).reshape(B, seq).mean(dim=1)  # (B,)
+            ).reshape(B, seq).sum(dim=1) / n_valid  # (B,)
             per_step_losses.append(loss_t)
 
         per_step_losses = torch.stack(per_step_losses, dim=1)  # (B, T)
@@ -302,7 +313,7 @@ def build_loop_transformer(
     d_model = int(parts[1].replace("D", ""))
     n_heads = d_model // 64
     intermediate_size = int(8 * d_model / 3)
-    intermediate_size = (intermediate_size + 63) // 64 * 64
+    intermediate_size = (intermediate_size + 255) // 256 * 256
 
     return LoopLM(
         vocab_size=vocab_size,

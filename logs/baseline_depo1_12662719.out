@@ -1,0 +1,6 @@
+Run 0: lr=0.0003
+Device: cuda:0 | World size: 4
+Context length: 2048
+Model parameters: 27,393,536 total, 0 Canon (0.00%)
+Architecture: 8L512D | RoPE=rope | Canon=
+Saved checkpoint to /nfs/roberts/scratch/pi_yc2299/psc37/Loop/checkpoints/baseline_depo1_N225_lr0.0003.pt

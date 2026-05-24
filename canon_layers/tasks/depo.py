@@ -20,7 +20,7 @@ class DepoTokenizer:
             self.node_min_len = 1
             self.node_max_len = 2
         else:  # depo2 — word-boundary encoding doubles effective node vocab
-            self.vocab_size = 4
+            self.vocab_size = 3  # matches author's code (mini_vocab=3 default in depo.py)
             self.node_min_len = 5
             self.node_max_len = 7
 
@@ -33,26 +33,29 @@ class DepoTokenizer:
         self.QUERY_OFFSET = self.NODE_VOCAB_OFFSET + self.vocab_size * 2
         self.total_vocab = self.QUERY_OFFSET + self.K_MAX + 1
 
-    def encode_node(self, node_id):
-        """Encode a node as a sequence of tokens.
-
-        Both length and content are seeded from node_id so every call with the
-        same node_id returns the identical token sequence within one instance.
-        Word-boundary encoding: inner tokens from [0, V-1], final token from [V, 2V-1].
-        """
-        rng = random.Random(node_id)
+    def encode_node(self, rng):
+        """Sample one token sequence using rng. Inner tokens from [0,V-1], boundary from [V,2V-1]."""
         length = rng.randint(self.node_min_len, self.node_max_len)
         if length > 1:
             toks = [self.NODE_VOCAB_OFFSET + rng.randint(0, self.vocab_size - 1)
                     for _ in range(length - 1)]
             toks.append(self.NODE_VOCAB_OFFSET + self.vocab_size +
                         rng.randint(0, self.vocab_size - 1))
-            return toks
-        # length == 1: single token acts as its own boundary token
-        return [self.NODE_VOCAB_OFFSET + self.vocab_size + rng.randint(0, self.vocab_size - 1)]
+            return tuple(toks)
+        return (self.NODE_VOCAB_OFFSET + self.vocab_size + rng.randint(0, self.vocab_size - 1),)
 
     def query_token(self, k):
         return self.QUERY_OFFSET + k
+
+
+def generate_node_words(rng, n, tok):
+    """Generate n distinct token sequences for n nodes (matching author's approach).
+    Guaranteed no collisions within an instance by construction.
+    """
+    words = set()
+    while len(words) < n:
+        words.add(tok.encode_node(rng))
+    return [list(w) for w in words]
 
 
 class DepoDataset(IterableDataset):
@@ -103,6 +106,9 @@ class DepoDataset(IterableDataset):
         tok = self.tokenizer
         n = self._sample_n(rng)
 
+        # Generate n DISTINCT word encodings fresh for this instance (no collisions)
+        word_list = generate_node_words(rng, n, tok)
+
         # Build random permutation (single directed cycle)
         nodes = list(range(n))
         rng.shuffle(nodes)
@@ -115,20 +121,19 @@ class DepoDataset(IterableDataset):
         tokens = [tok.BOS]
         mask = [0]
         for x, y in edges:
-            xt, yt = tok.encode_node(x), tok.encode_node(y)
+            xt, yt = word_list[x], word_list[y]
             tokens += xt + yt
             mask += [0] * (len(xt) + len(yt))
 
-        # t = min(10, n) queries per instance
-        for _ in range(min(10, n)):
+        # t = min(10, n) queries per instance, distinct starting nodes (no replacement)
+        for q in rng.sample(nodes, min(10, n)):
             k = rng.randint(1, self.K)
-            q = rng.choice(nodes)
             cur = q
             for _ in range(k):
                 cur = perm[cur]
 
-            q_toks = tok.encode_node(q)
-            a_toks = tok.encode_node(cur)
+            q_toks = word_list[q]
+            a_toks = word_list[cur]
             tokens += [tok.query_token(k)] + q_toks + [tok.ANS] + a_toks
             mask += [0] * (1 + len(q_toks))   # query token + query node: not in loss
             mask += [1] + [1] * len(a_toks)    # <ans> + answer tokens: in loss

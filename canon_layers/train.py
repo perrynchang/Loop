@@ -20,7 +20,7 @@ from tasks import (
     build_brevo_dataset, BrevoTokenizer,
     build_mano_dataset, ManoTokenizer,
     build_lano_dataset, LanoTokenizer,
-    build_capo_dataset,
+    build_capo_dataset, CAPO_VOCAB_SIZE, get_capo_vocab_size,
     build_bios_dataset, BioSTokenizer,
     build_bios32_dataset, BioS32Tokenizer,
 )
@@ -34,7 +34,7 @@ TASK_DEFAULT_CONTEXT = {
 
 
 def get_task_config(task, variant, N, K, L, context_len_override=None,
-                    bios_query_types='all', bios_cot_prob=0.5, rank=0):
+                    bios_query_types='all', bios_cot_prob=0.5, rank=0, world_size=1, seed=42):
     """Return (dataset, vocab_size, context_len) for a given task."""
     if task == "depo":
         ctx = context_len_override or TASK_DEFAULT_CONTEXT["depo"]
@@ -43,23 +43,23 @@ def get_task_config(task, variant, N, K, L, context_len_override=None,
         return ds, tok.total_vocab, ctx
     elif task == "brevo":
         ctx = context_len_override or TASK_DEFAULT_CONTEXT.get(variant, 1024)
-        ds = build_brevo_dataset(variant=variant, N=N, context_len=ctx)
+        ds = build_brevo_dataset(variant=variant, N=N, context_len=ctx, seed=seed + rank * 10000)
         tok = BrevoTokenizer(variant)
         return ds, tok.total_vocab, ctx
     elif task == "mano":
         ctx = context_len_override or TASK_DEFAULT_CONTEXT["mano"]
-        ds = build_mano_dataset(L=L, context_len=ctx)
+        ds = build_mano_dataset(L=L, context_len=ctx, seed=seed + rank * 10000)
         tok = ManoTokenizer()
         return ds, tok.total_vocab, ctx
     elif task == "lano":
         ctx = context_len_override or TASK_DEFAULT_CONTEXT.get(variant, 512)
-        ds = build_lano_dataset(variant=variant)
+        ds = build_lano_dataset(variant=variant, seed=seed + rank * 10000)
         tok = LanoTokenizer()
         return ds, tok.total_vocab, ctx
     elif task == "capo":
         ctx = context_len_override or TASK_DEFAULT_CONTEXT["capo"]
-        ds = build_capo_dataset(N=N)
-        return ds, 256, ctx
+        ds = build_capo_dataset(N=N, rank=rank, world_size=world_size)
+        return ds, get_capo_vocab_size(), ctx
     elif task == "bios":
         # variant encodes augmentations: e.g. "", "permute", "permute+fullname+multi2"
         ctx = context_len_override or TASK_DEFAULT_CONTEXT["bios"]
@@ -116,6 +116,9 @@ def train(args):
     if is_main:
         print(f"Device: {device} | World size: {world_size}")
 
+    # Seed model initialization (data seed is handled per-rank inside get_task_config)
+    torch.manual_seed(args.seed + rank)
+
     # Build dataset
     dataset, vocab_size, context_len = get_task_config(
         args.task, args.variant, args.N, args.K, args.L,
@@ -123,18 +126,22 @@ def train(args):
         bios_query_types=args.bios_query_types,
         bios_cot_prob=args.bios_cot_prob,
         rank=rank,
+        world_size=world_size,
+        seed=args.seed,
     )
     if is_main:
         print(f"Context length: {context_len}")
 
     # Each rank processes batch_size // world_size samples; total = args.batch_size
     per_gpu_batch = max(1, args.batch_size // world_size)
-    num_workers = 0 if device.type == "mps" else min(2, os.cpu_count())
+    num_workers = 0 if device.type == "mps" else min(4, os.cpu_count())
     dataloader = DataLoader(
         dataset,
         batch_size=per_gpu_batch,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
+        prefetch_factor=4 if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
     )
 
     # Build model
@@ -163,11 +170,17 @@ def train(args):
             tie_weights=args.tie_weights,
         ).to(device)
 
+    if device.type == "cuda":
+        model = torch.compile(model, mode="reduce-overhead")
+
     if world_size > 1:
         model = DDP(model, device_ids=[rank])
 
     # raw_model is used for parameter counts and checkpoint saving
+    # Unwrap DDP, then unwrap torch.compile's OptimizedModule if present
     raw_model = model.module if world_size > 1 else model
+    if hasattr(raw_model, '_orig_mod'):
+        raw_model = raw_model._orig_mod
 
     if is_main:
         n_params = raw_model.num_parameters()
@@ -213,7 +226,7 @@ def train(args):
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
             if use_loop:
-                loss, metrics = model.loop_loss(inputs, targets, beta=args.loop_beta)
+                loss, metrics = model.loop_loss(inputs, targets, beta=args.loop_beta, ans_mask=ans_mask)
                 total_entropy += metrics['entropy']
                 total_avg_exit += metrics['avg_exit_step']
             else:
@@ -283,12 +296,14 @@ def parse_args():
     p.add_argument("--N", type=int, default=225, help="Max graph/permutation size")
     p.add_argument("--K", type=int, default=8, help="Max hop depth (Depo)")
     p.add_argument("--L", type=int, default=10, help="Max expression length (Mano)")
+    p.add_argument("--seed", type=int, default=42, help="Base random seed for data and model init")
 
     # Model
     p.add_argument("--model_type", choices=["transformer", "loop"], default="transformer",
                    help="Model type: standard transformer or LoopLM")
     p.add_argument("--model_size", default="8L512D",
-                   choices=["6L256D", "8L512D", "12L512D", "8L768D", "12L768D"],
+                   choices=["2L512D", "3L384D", "5L384D", "6L384D",
+                            "6L256D", "8L512D", "12L512D", "8L768D", "12L768D"],
                    help="Model size: {layers}L{hidden}D")
     # LoopLM-specific
     p.add_argument("--T_max", type=int, default=4,

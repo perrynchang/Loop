@@ -1,0 +1,6 @@
+Run 2: lr=0.0002 seed=42
+Device: cuda:0 | World size: 4
+Context length: 1024
+Model parameters: 27,333,120 total, 0 Canon (0.00%)
+Architecture: 8L512D | RoPE=rope | Canon=
+Saved checkpoint to checkpoints/baseline_mano_L10_lr0.0002_seed42.pt
