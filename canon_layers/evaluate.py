@@ -10,7 +10,7 @@ from collections import defaultdict
 
 from models import build_transformer, build_loop_transformer
 from tasks.depo import DepoTokenizer, generate_node_words
-from tasks.brevo import BrevoTokenizer, build_random_dag, topological_reachable
+from tasks.brevo import BrevoTokenizer, build_random_dag, topological_reachable, _generate_brevo_words
 from tasks.mano import ManoTokenizer, build_expr, eval_expr, serialize_expr, MOD
 from tasks.lano import LanoTokenizer, CFG_RULES, CFG_ROOTS, generate_sentence, is_valid_cfg
 from tasks.bios import (
@@ -34,7 +34,7 @@ def load_model(checkpoint_path, device):
     from tasks import (DepoTokenizer, BrevoTokenizer, ManoTokenizer, LanoTokenizer)
     task_vocab = {
         'depo': DepoTokenizer(args.get('variant', 'depo1')).total_vocab,
-        'brevo': BrevoTokenizer(args.get('variant', 'brevo1')).total_vocab,
+        'brevo': BrevoTokenizer(args.get('variant', 'brevo1'), N=args.get('N', 110)).total_vocab,
         'mano': ManoTokenizer().total_vocab,
         'lano': LanoTokenizer().total_vocab,
         'capo': get_capo_vocab_size(),
@@ -122,7 +122,7 @@ def evaluate_depo(model, variant="depo1", N=225, K=8, n_samples=50, device='cpu'
                     q_toks = word_list[q]
                     a_toks = word_list[cur]
                     inst_toks += [tok.query_token(target_k)] + q_toks + [tok.ANS] + a_toks
-                    inst_mask += [0] * (1 + len(q_toks)) + [1] * (1 + len(a_toks))
+                    inst_mask += [0] * (1 + len(q_toks)) + [0] + [1] * len(a_toks)
 
                 token_buf.extend(inst_toks)
                 mask_buf.extend(inst_mask)
@@ -146,7 +146,7 @@ def evaluate_depo(model, variant="depo1", N=225, K=8, n_samples=50, device='cpu'
 @torch.no_grad()
 def evaluate_brevo(model, variant="brevo1", N=70, n_samples=100, device='cpu'):
     """Evaluate DAG traversal accuracy on Brevo task."""
-    tok = BrevoTokenizer(variant)
+    tok = BrevoTokenizer(variant, N=N)
     rng = random.Random(88888)
     correct = 0
     total = 0
@@ -154,27 +154,41 @@ def evaluate_brevo(model, variant="brevo1", N=70, n_samples=100, device='cpu'):
     for _ in range(n_samples):
         n = N
         edges = build_random_dag(n, max_degree=4, rng=rng)
-        children = defaultdict(list)
+        parents = defaultdict(list)
         for u, v in edges:
-            children[u].append(v)
+            parents[v].append(u)
 
-        nodes_with_children = [u for u in range(n) if children[u]]
-        if not nodes_with_children:
+        start = max(3 * n // 4, n - 1)
+        candidates = [v for v in range(start, n) if parents[v]]
+        if not candidates:
             continue
-        q = rng.choice(nodes_with_children)
-        expected_answer = topological_reachable(q, children, n)
+        q = rng.choice(candidates)
+        expected_answer = topological_reachable(q, parents, rng)
         if not expected_answer:
             continue
+
+        if tok.variant == "brevo2":
+            words = _generate_brevo_words(
+                rng, n, tok.vocab_size, tok.node_min_len, tok.node_max_len, tok.NODE_OFFSET
+            )
+            rng.shuffle(words)
+            word_map = {node_id: list(words[node_id]) for node_id in range(n)}
+            rev_word_map = {tuple(w): node_id for node_id, w in word_map.items()}
+            encode = word_map.__getitem__
+        else:
+            perm = rng.sample(range(tok.vocab_size), n)
+            tok_to_node = {tok.NODE_OFFSET + perm[v]: v for v in range(n)}
+            encode = lambda node_id: [tok.NODE_OFFSET + perm[node_id]]
 
         # Build input: edges + query
         tokens = [tok.BOS]
         edge_list = list(edges)
         rng.shuffle(edge_list)
         for u, v in edge_list:
-            tokens += tok.encode_node(u, rng)
-            tokens += tok.encode_node(v, rng)
+            tokens += encode(u)
+            tokens += encode(v)
         tokens.append(tok.QUERY)
-        tokens += tok.encode_node(q, rng)
+        tokens += encode(q)
         tokens.append(tok.ANS)
 
         # Generate answer tokens autoregressively
@@ -188,12 +202,34 @@ def evaluate_brevo(model, variant="brevo1", N=70, n_samples=100, device='cpu'):
             generated.append(next_tok)
             x_in = torch.cat([x_in, torch.tensor([[next_tok]], device=device)], dim=1)
 
-        # Compare generated to expected (simplified: check length)
-        expected_tokens = []
-        for a in expected_answer:
-            expected_tokens += tok.encode_node(a, rng)
+        # Decode generated tokens back to node IDs
+        if tok.variant == "brevo2":
+            gen_nodes = []
+            word_buf = []
+            for t in generated:
+                word_buf.append(t)
+                if tok.NODE_OFFSET + tok.vocab_size < t <= tok.NODE_OFFSET + 2 * tok.vocab_size:
+                    node_id = rev_word_map.get(tuple(word_buf))
+                    if node_id is not None:
+                        gen_nodes.append(node_id)
+                    word_buf = []
+        else:
+            gen_nodes = [tok_to_node[t] for t in generated if t in tok_to_node]
 
-        correct += int(generated == expected_tokens)
+        # Accept any valid topological ordering of the expected ancestor set
+        expected_set = set(expected_answer)
+        if set(gen_nodes) == expected_set:
+            seen = set()
+            valid = True
+            for node in gen_nodes:
+                for parent in parents.get(node, []):
+                    if parent in expected_set and parent not in seen:
+                        valid = False
+                        break
+                if not valid:
+                    break
+                seen.add(node)
+            correct += int(valid)
         total += 1
 
     return correct / total if total > 0 else 0.0

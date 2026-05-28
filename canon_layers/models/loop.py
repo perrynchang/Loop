@@ -93,11 +93,23 @@ class LoopLM(nn.Module):
             h = block(h)
         return h
 
-    def forward(self, x: torch.Tensor, T: int = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, targets: torch.Tensor = None,
+                beta: float = 0.1, ans_mask: torch.Tensor = None,
+                T: int = None, objective: str = 'stage1'):
         """
-        Standard forward pass (T_max loops). Returns final logits.
-        Compatible with the existing training/evaluation API.
+        Inference: forward(x) → logits
+        Training:  forward(x, targets, ...) → (loss, metrics_dict)
+
+        The training path exists so DDP's forward() is invoked, ensuring
+        reducer.prepare_for_backward() is called and gradient sync is correct.
+
+        objective: 'stage1'   — entropy-regularised exit distribution (ByteDance)
+                   'deep_sup' — mean CE over all steps, no exit gate
         """
+        if targets is not None:
+            if objective == 'deep_sup':
+                return self.deep_supervision_loss(x, targets, ans_mask=ans_mask, T=T)
+            return self.loop_loss(x, targets, beta=beta, T=T, ans_mask=ans_mask)
         T = T or self.T_max
         h = self.embedding(x)
         for _ in range(T):
@@ -216,6 +228,46 @@ class LoopLM(nn.Module):
             'entropy': entropy.item(),
             'avg_exit_step': avg_exit,
         }
+
+    def deep_supervision_loss(
+        self,
+        x: torch.Tensor,
+        targets: torch.Tensor,
+        ans_mask: torch.Tensor = None,
+        T: int = None,
+    ):
+        """
+        Deep supervision loss: mean CE over all T_max steps, answer-masked.
+        No exit gate, no entropy regularisation.
+
+          L = (1/T) Σ_t CE_ans(t)
+
+        Each recurrent step receives equal gradient signal, training the shared
+        weights to progressively resolve deeper hops with each application.
+        """
+        T = T or self.T_max
+        B, seq = targets.shape
+        V = self.vocab_size
+
+        if ans_mask is not None:
+            targets = targets.masked_fill(~ans_mask[:, 1:], -100)
+        n_valid = (targets != -100).float().sum(dim=1).clamp(min=1)
+
+        h = self.embedding(x)
+        step_losses = []
+        for _ in range(T):
+            h = self._one_loop(h)
+            logits_t = self.lm_head(self.norm_f(h))
+            loss_t = F.cross_entropy(
+                logits_t.reshape(-1, V),
+                targets.reshape(-1),
+                ignore_index=-100,
+                reduction='none',
+            ).reshape(B, seq).sum(dim=1) / n_valid
+            step_losses.append(loss_t.mean())
+
+        total_loss = torch.stack(step_losses).mean()
+        return total_loss, {'entropy': 0.0, 'avg_exit_step': float(T)}
 
     # ------------------------------------------------------------------
     # Inference with early exit

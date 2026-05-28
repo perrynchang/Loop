@@ -44,7 +44,7 @@ def get_task_config(task, variant, N, K, L, context_len_override=None,
     elif task == "brevo":
         ctx = context_len_override or TASK_DEFAULT_CONTEXT.get(variant, 1024)
         ds = build_brevo_dataset(variant=variant, N=N, context_len=ctx, seed=seed + rank * 10000)
-        tok = BrevoTokenizer(variant)
+        tok = BrevoTokenizer(variant, N=N)
         return ds, tok.total_vocab, ctx
     elif task == "mano":
         ctx = context_len_override or TASK_DEFAULT_CONTEXT["mano"]
@@ -174,7 +174,8 @@ def train(args):
         model = torch.compile(model, mode="reduce-overhead")
 
     if world_size > 1:
-        model = DDP(model, device_ids=[rank])
+        find_unused = use_loop and args.loop_objective == 'deep_sup'
+        model = DDP(model, device_ids=[rank], find_unused_parameters=find_unused)
 
     # raw_model is used for parameter counts and checkpoint saving
     # Unwrap DDP, then unwrap torch.compile's OptimizedModule if present
@@ -226,7 +227,7 @@ def train(args):
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
             if use_loop:
-                loss, metrics = model.loop_loss(inputs, targets, beta=args.loop_beta, ans_mask=ans_mask)
+                loss, metrics = model(inputs, targets=targets, beta=args.loop_beta, ans_mask=ans_mask, objective=args.loop_objective)
                 total_entropy += metrics['entropy']
                 total_avg_exit += metrics['avg_exit_step']
             else:
@@ -303,13 +304,16 @@ def parse_args():
                    help="Model type: standard transformer or LoopLM")
     p.add_argument("--model_size", default="8L512D",
                    choices=["2L512D", "3L384D", "5L384D", "6L384D",
-                            "6L256D", "8L512D", "12L512D", "8L768D", "12L768D"],
+                            "6L256D", "8L512D", "12L512D", "8L768D", "12L768D",
+                            "2L768D", "4L768D"],
                    help="Model size: {layers}L{hidden}D")
     # LoopLM-specific
     p.add_argument("--T_max", type=int, default=4,
                    help="Number of recurrent steps (LoopLM only)")
     p.add_argument("--loop_beta", type=float, default=0.1,
                    help="Entropy regularisation coefficient β (LoopLM Stage I)")
+    p.add_argument("--loop_objective", choices=["stage1", "deep_sup"], default="stage1",
+                   help="LoopLM training objective: stage1 (entropy-regularised exit) or deep_sup (mean CE over all steps)")
     p.add_argument("--rope", choices=["rope", "nope", "none"], default="rope",
                    help="Positional encoding type")
     p.add_argument("--rope_fraction", type=float, default=1.0,
